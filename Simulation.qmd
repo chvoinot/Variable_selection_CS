@@ -1,0 +1,15 @@
+---
+title: "Essai simulation"
+author: "CV"
+format: html
+editor: visual
+---
+
+# Simulation test without censoring 
+
+Simulation set of a RCT without censoring : 
+- A, the treatment asignment is random. 
+- T, the time to event is influenced by P, a set of precision variable. 
+
+The objective is to compute the average treatment effect. In this 
+
