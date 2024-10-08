@@ -5,11 +5,645 @@ format: html
 editor: visual
 ---
 
-# Simulation test without censoring 
+# Simulation test with independent censoring 
 
-Simulation set of a RCT without censoring : 
+Simulation set of a RCT with independent censoring : 
+
 - A, the treatment asignment is random. 
-- T, the time to event is influenced by P, a set of precision variable. 
+- C, the censoring time is independent of the event time.
+- T, the time to event.
+- P, the precision variables.
+- $\tilde{T}=min(T,C)$, the observed time to event.
+- $\delta=I(T<C)$, the censoring indicator.
 
-The objective is to compute the average treatment effect. In this 
+The objective is to compute the average treatment effect. In this simulation, the true treatment effect is set to $T_1=T_0+10$. 
 
+The simulation is set as follows :
+- $P~N(\mu=[0,0,0,0,0],\Sigma=I)$
+- $e(X)=P(A=1)$, the propensity score is set to 0.5.
+- $\lambda_0(t)=0.1*exp(0.1*P_1+0.2*P_2+0.3*P_3+0.4*P_4+0.5*P_5)$ the hazard function for the event time $T_0$. 
+- $\lambda_c(t)=0.1$ the hazard function for the censoring time $C$.
+- $T_1=T_0+10$
+- The event time is $T= A*T_1+(1-A)*T_0$
+
+The time of event is simulated using the cumulative hazard inversion method for exponential models.
+
+The simulation code is the following :
+
+```{r}  
+set.seed(123)
+# function to compute the simulation 
+simulate_data_RCT <- function(n, tau, scenario = "RCT") {
+  # Simulate the precision variables
+  P <- matrix(rnorm(n*5),n,5)
+  colnames(P)<-c("P1","P2","P3","P4","P5")
+  e <- rep(0.5,n)
+  A <- rbinom(n,1,e)
+  # Simulate the outcome using the cumulative hazard inversion method
+  epsilon <- runif(n, min = 1e-8, max = 1)
+  T0 <- -log(epsilon) / (0.1*exp(0.1*P[,1]+0.2*P[,2]+0.3*P[,3]+0.4*P[,4]+0.5*P[,5]))
+  T1 <- T0 + 10
+  T <- A * T1 + (1 - A) * T0
+  # Simulate the censoring time 
+  epsilon <- runif(n, min = 1e-8, max = 1)
+  C <- -log(epsilon) / 0.05
+  # Simulate the observed time
+  T_obs <- pmin(T,C) 
+  T_obs_tau <- pmin(T_obs,tau)
+  status <- as.numeric(T_obs >= T)
+  # data frame for the simulation
+  data <- data.frame(A,P,T0,T1,T,C,T_obs,status,T_obs_tau)
+  return(data)
+}
+
+# data frame for the simulation
+data <- simulate_data_RCT(n=1000,tau=20)
+summary(data)
+```
+
+
+
+Undajusted Kaplan meier: 
+
+```{r}
+# Function to calculate the integral of a decreasing function using 
+# the rectangle method
+# x corresponds to the x coordinate of the function to integrate
+# y corresponds to the y coordinate
+integral_rectangles <- function(x, y) {
+  # Check if the lengths of x and y are the same
+  if (length(x) != length(y)) {
+    stop("Lengths of x and y must be the same")
+  }
+  
+  # Calculate the width of each rectangle
+  dx <- diff(x)
+  
+  # Initialize the sum
+  integral_sum <- 0
+  
+  # Iterate through each rectangle and sum up the areas
+  for (i in 1:(length(x) - 1)) {
+    # Calculate the height of the current rectangle
+    height <- min(y[i], y[i + 1])
+    
+    # Multiply the height by the width and add it to the sum
+    integral_sum <- integral_sum + height * dx[i]
+  }
+  mean <- integral_sum + x[1]
+  # Return the final integral sum
+  return(mean)
+}
+
+# Kaplan-Meier estimator handmade implementation
+# The database 'data' must be in the same form as that shown in 
+# notation (Table 1) and with the same variable name (status, T_obs) 
+Kaplan_meier_handmade <- function(data, 
+                                  status = data$status, 
+                                  T_obs = data$T_obs) {
+  # Sort unique observed times
+  Y.grid <- sort(unique(T_obs))
+  
+  # Initialize vectors for number of events, number at risk, and survival 
+  # probability
+  d <- rep(NA, length(Y.grid))  # Number of events at time Y.grid[i]
+  n <- rep(NA, length(Y.grid))  # Number at risk just before time Y.grid[i]
+  S <- rep(NA, length(Y.grid))  # Survival probability at time Y.grid[i]
+  
+  # Loop over each unique observed time
+  for (i in 1:length(Y.grid)) {
+    d[i] <- sum(T_obs == Y.grid[i] & status == 1, na.rm = TRUE)  # Count events
+    n[i] <- sum(T_obs >= Y.grid[i])  # Count at risk
+    
+    # Calculate survival probability
+    S[i] <- cumprod(1 - d / n)[i]
+  }
+  
+  # Create a data frame with the results
+  df <- data.frame(d = d, n = n, S = S, T = Y.grid)
+  
+  return(df)
+}
+
+# Function to calculate RMST (Restricted Mean Survival Time):
+# Method 1: Handmade KM with no truncation
+
+# Two possibilities of computing RMST : 
+# - in using directly S_A1 and S_A0 (survival function of treated and control)
+# - in using the dataframe and the function computes the survival functions
+RMST_1 <- function(data = NULL, A1 = 1, A0 = 0, tau, S_A1 = NULL, S_A0 = NULL) {
+  if (is.null(S_A1) & is.null(S_A0)) {
+    # Subset data for treatment groups
+    data1 <- data[data$A == A1,]
+    data0 <- data[data$A == A0,]
+    
+    # Calculate Kaplan-Meier survival estimates
+    S_A1 <- Kaplan_meier_handmade(data1, status = data1$status, 
+                                  T_obs = data1$T_obs)
+    S_A0 <- Kaplan_meier_handmade(data0, status = data0$status, 
+                                  T_obs = data0$T_obs)
+    
+    # Restrict observations to those less than or equal to tau
+    Y.grid1 <- data1$T_obs[data1$T_obs <= tau]
+    Y.grid0 <- data0$T_obs[data0$T_obs <= tau]
+  } else {
+    # Restrict observations to those less than or equal to tau
+    Y.grid1 <- S_A1$T[S_A1$T <= tau]
+    Y.grid0 <- S_A0$T[S_A0$T <= tau]
+  }
+  
+  # Filter survival estimates to restricted observations
+  S_A1 <- S_A1 %>%
+    dplyr::filter(T %in% Y.grid1)
+  S_A0 <- S_A0 %>%
+    dplyr::filter(T %in% Y.grid0)
+  
+  # Check if there is any event at tau for S_A1
+  if (!any(S_A1$T == tau)) {
+    new_row <- tibble(T = tau, S = S_A1$S[nrow(S_A1)])
+    S_A1 <- dplyr::bind_rows(S_A1, new_row)
+  }
+  
+  # Check if there is any event at tau for S_A0
+  if (!any(S_A0$T == tau)) {
+    new_row <- tibble(T = tau, S = S_A0$S[nrow(S_A0)])
+    S_A0 <- dplyr::bind_rows(S_A0, new_row)
+  }
+
+  # Calculate integrals from 0 to tau of survival probabilities
+  intA1 <- integral_rectangles(S_A1$T, S_A1$S)
+  intA0 <- integral_rectangles(S_A0$T, S_A0$S)
+  RMST1 <- intA1 - intA0
+  
+  return(list(RMST=RMST1, intA1=intA1,intA0=intA0))
+}
+
+```
+
+G-formula :
+
+```{r}
+library(survival)
+# Function to estimate the g-formula Two-learner.
+g_formula_T_learner <- function(data, 
+                                X.names.outcome, 
+                                tau, 
+                                nuisance_survival = "cox", 
+                                n.folds = NULL) {
+  # Compute min(T_obs,tau)
+  data$T_obs_tau <- ifelse(data$T_obs >= tau, tau, data$T_obs)
+  
+  # Y.grid is the grid of time points where we want to estimate the 
+  # survival function.
+  Y.grid <- sort(unique(data$T_obs_tau))
+  
+  # Subset data for A == 0.
+  data0 <- data %>% filter(A == 0)
+  
+  # Subset data for A == 1.
+  data1 <- data %>% filter(A == 1)
+  
+  # Cox 
+  if (nuisance_survival == "cox") {
+    outcome <- 'Surv(T_obs, status)'
+    
+    # cph do not support notation I(X^2) but X^2 directly (contrary to coxph) 
+    X.names.outcome <- gsub("I\\((X[0-9]+\\^2)\\)", "\\1", X.names.outcome)
+
+    
+    # Learn Cox regression on two datasets: A|X.
+    f <- as.formula(paste(outcome, paste(c(X.names.outcome), collapse = " + "), 
+                          sep = " ~ "))
+    
+    # Fit the two models on the covariates of time Y.grid.
+    fitS0 <- cph(f, data = data0, y = TRUE, x = TRUE, times = Y.grid)
+    fitS1 <- cph(f, data = data1, y = TRUE, x = TRUE, times = Y.grid)
+    
+    # Predict survival probabilities for each individual at each Y.grid.
+    fit.pred1 <- predictCox(fitS1, newdata = data, times = Y.grid, 
+                            type = "survival")
+    fit.pred0 <- predictCox(fitS0, newdata = data, times = Y.grid, 
+                            type = "survival")
+    
+    # Survival probabilities for each individual at each Y.grid.
+    S_hat1 <- fit.pred1$survival
+    S_hat0 <- fit.pred0$survival
+  } else {
+    # Survival forest.
+    # Initialize objects
+    n <- nrow(data)
+    fit.pred1 <- matrix(NA, nrow = n, ncol = length(Y.grid))
+    fit.pred0 <- matrix(NA, nrow = n, ncol = length(Y.grid))
+    
+    if (n.folds > 1) {
+      # Split the dataset into n-folds.
+      indices <- split(seq(n), sort(seq(n) %% n.folds))
+      
+      # For all index in each split.
+      for (idx in indices) {
+        # Fit survival forest on all observations with A=1 except idx 
+        forest.grf1 <- survival_forest(
+          X = as.matrix(data[-idx & data[, "A"] == 1, X.names.outcome]),
+          Y = data[-idx & data[, "A"] == 1, "T_obs"],
+          D = data[-idx & data[, "A"] == 1, "status"],
+          failure.times = Y.grid
+        )
+        # Fit survival forest on all observations with A=0 except idx
+        forest.grf0 <- survival_forest(
+          X = as.matrix(data[-idx & data[, "A"] == 0, X.names.outcome]),
+          Y = data[-idx & data[, "A"] == 0, "T_obs"],
+          D = data[-idx & data[, "A"] == 0, "status"],
+          failure.times = Y.grid
+        )
+        # Predict on idx 
+        fit.pred1[idx, ] <- predict(
+          forest.grf1, as.matrix(data[idx, X.names.outcome]),
+          failure.times = Y.grid)$predictions
+        
+        fit.pred0[idx, ] <- predict(
+          forest.grf0, as.matrix(data[idx, X.names.outcome]),
+          failure.times = Y.grid)$predictions
+      }
+    } else if (n.folds == 0 | n.folds == 1) {
+      # If no cross-fitting 
+      # Fit survival forest on all observation with A=1
+      forest.grf1 <- survival_forest(
+        X = as.matrix(data[data[, "A"] == 1, X.names.outcome]),
+        Y = data[data[, "A"] == 1, "T_obs"],
+        D = data[data[, "A"] == 1, "status"],
+        failure.times = Y.grid
+      )
+      # Fit survival forest on all observation with A=0
+      forest.grf0 <- survival_forest(
+        X = as.matrix(data[data[, "A"] == 0, X.names.outcome]),
+        Y = data[data[, "A"] == 0, "T_obs"],
+        D = data[data[, "A"] == 0, "status"],
+        failure.times = Y.grid
+      )
+      # Predict on all observations
+      fit.pred1 <- predict(forest.grf1, as.matrix(data[, X.names.outcome]), 
+                           failure.times = Y.grid)$predictions
+      fit.pred0 <- predict(forest.grf0, as.matrix(data[, X.names.outcome]), 
+                           failure.times = Y.grid)$predictions
+    }
+    
+    S_hat1 <- fit.pred1
+    S_hat0 <- fit.pred0
+  }
+  
+  # Compute the area under each survival curve until max(Y.grid) = tau.
+  E_hat1 <- expected_survival(S_hat1, Y.grid)
+  E_hat0 <- expected_survival(S_hat0, Y.grid)
+  
+  # Calculate the mean difference.
+  theta_g_formula <- mean(E_hat1 - E_hat0)
+  
+  return(theta_g_formula)
+}
+
+expected_survival <- function(S.hat, Y.grid) {
+  # Y.grid: vector of time at which to evaluate the survival estimates 
+  # (same as S.hat).
+  
+  # Calculate the distance between each time point.
+  grid.diff <- diff(c(0, Y.grid, max(Y.grid)))
+  
+  # Compute the area under each survival curve.
+  area <- c(base::cbind(1, S.hat) %*% grid.diff)
+  
+  return(area)
+}
+
+# Function to estimate the g-formula Two-learner.
+g_formula_T_learner <- function(data, 
+                                X.names.outcome, 
+                                tau, 
+                                nuisance_survival = "cox", 
+                                n.folds = NULL) {
+  # Compute min(T_obs,tau)
+  data$T_obs_tau <- ifelse(data$T_obs >= tau, tau, data$T_obs)
+  
+  # Y.grid is the grid of time points where we want to estimate the 
+  # survival function.
+  Y.grid <- sort(unique(data$T_obs_tau))
+  
+  # Subset data for A == 0.
+  data0 <- data %>% filter(A == 0)
+  
+  # Subset data for A == 1.
+  data1 <- data %>% filter(A == 1)
+  
+  # Cox 
+  if (nuisance_survival == "cox") {
+    outcome <- 'Surv(T_obs, status)'
+    
+    # cph do not support notation I(X^2) but X^2 directly (contrary to coxph) 
+    X.names.outcome <- gsub("I\\((X[0-9]+\\^2)\\)", "\\1", X.names.outcome)
+
+    
+    # Learn Cox regression on two datasets: A|X.
+    f <- as.formula(paste(outcome, paste(c(X.names.outcome), collapse = " + "), 
+                          sep = " ~ "))
+    
+    # Fit the two models on the covariates of time Y.grid.
+    fitS0 <- cph(f, data = data0, y = TRUE, x = TRUE, times = Y.grid)
+    fitS1 <- cph(f, data = data1, y = TRUE, x = TRUE, times = Y.grid)
+    
+    # Predict survival probabilities for each individual at each Y.grid.
+    fit.pred1 <- predictCox(fitS1, newdata = data, times = Y.grid, 
+                            type = "survival")
+    fit.pred0 <- predictCox(fitS0, newdata = data, times = Y.grid, 
+                            type = "survival")
+    
+    # Survival probabilities for each individual at each Y.grid.
+    S_hat1 <- fit.pred1$survival
+    S_hat0 <- fit.pred0$survival
+  } else {
+    # Survival forest.
+    # Initialize objects
+    n <- nrow(data)
+    fit.pred1 <- matrix(NA, nrow = n, ncol = length(Y.grid))
+    fit.pred0 <- matrix(NA, nrow = n, ncol = length(Y.grid))
+    
+    if (n.folds > 1) {
+      # Split the dataset into n-folds.
+      indices <- split(seq(n), sort(seq(n) %% n.folds))
+      
+      # For all index in each split.
+      for (idx in indices) {
+        # Fit survival forest on all observations with A=1 except idx 
+        forest.grf1 <- survival_forest(
+          X = as.matrix(data[-idx & data[, "A"] == 1, X.names.outcome]),
+          Y = data[-idx & data[, "A"] == 1, "T_obs"],
+          D = data[-idx & data[, "A"] == 1, "status"],
+          failure.times = Y.grid
+        )
+        # Fit survival forest on all observations with A=0 except idx
+        forest.grf0 <- survival_forest(
+          X = as.matrix(data[-idx & data[, "A"] == 0, X.names.outcome]),
+          Y = data[-idx & data[, "A"] == 0, "T_obs"],
+          D = data[-idx & data[, "A"] == 0, "status"],
+          failure.times = Y.grid
+        )
+        # Predict on idx 
+        fit.pred1[idx, ] <- predict(
+          forest.grf1, as.matrix(data[idx, X.names.outcome]),
+          failure.times = Y.grid)$predictions
+        
+        fit.pred0[idx, ] <- predict(
+          forest.grf0, as.matrix(data[idx, X.names.outcome]),
+          failure.times = Y.grid)$predictions
+      }
+    } else if (n.folds == 0 | n.folds == 1) {
+      # If no cross-fitting 
+      # Fit survival forest on all observation with A=1
+      forest.grf1 <- survival_forest(
+        X = as.matrix(data[data[, "A"] == 1, X.names.outcome]),
+        Y = data[data[, "A"] == 1, "T_obs"],
+        D = data[data[, "A"] == 1, "status"],
+        failure.times = Y.grid
+      )
+      # Fit survival forest on all observation with A=0
+      forest.grf0 <- survival_forest(
+        X = as.matrix(data[data[, "A"] == 0, X.names.outcome]),
+        Y = data[data[, "A"] == 0, "T_obs"],
+        D = data[data[, "A"] == 0, "status"],
+        failure.times = Y.grid
+      )
+      # Predict on all observations
+      fit.pred1 <- predict(forest.grf1, as.matrix(data[, X.names.outcome]), 
+                           failure.times = Y.grid)$predictions
+      fit.pred0 <- predict(forest.grf0, as.matrix(data[, X.names.outcome]), 
+                           failure.times = Y.grid)$predictions
+    }
+    
+    S_hat1 <- fit.pred1
+    S_hat0 <- fit.pred0
+  }
+  
+  # Compute the area under each survival curve until max(Y.grid) = tau.
+  E_hat1 <- expected_survival(S_hat1, Y.grid)
+  E_hat0 <- expected_survival(S_hat0, Y.grid)
+  
+  # Calculate the mean difference.
+  theta_g_formula <- mean(E_hat1 - E_hat0)
+  
+  return(theta_g_formula)
+}
+```
+
+
+Create a function where the data frame is created 100 times and the estimator compute also 100 times the treatment effect 
+
+```{r}
+# Function to estimate the g-formula Two-learner.
+all_estimates <- function(data, sample.size, tau, 
+                          X.names.outcome, 
+                          nuisance_survival = "cox") {
+  
+  # Store the results in a data frame
+  results <- data.frame(
+    "sample.size" = numeric(),
+    "estimate" = numeric(),
+    "estimator" = character(),
+    "nuisance" = character()
+  )
+
+    ATE_unadjusted <- RMST_1(data = data, A1 = 1, A0 = 0, tau)$RMST
+    # RMST estimate with g-formula two-learners
+    ATE_g_formula <- g_formula_T_learner(data, tau = tau, 
+                                       X.names.outcome = X.names.outcome, 
+                                       nuisance = nuisance_survival)
+    
+      results <- data.frame(
+        "sample.size" = rep(sample.size, 2),
+        "estimate" = c(ATE_unadjusted, 
+          ATE_g_formula
+        ),
+        "estimator" = c( "Unadjusted KM",
+          "G_formula (T-learners)"
+        ),
+        "nuisance" = rep(
+          paste(nuisance_survival, sep = "+"), 2
+        )
+      )
+    
+  
+  return(results)
+}
+
+# Function to compute estimators for multiple simulations and sample sizes
+compute_estimator <- function(n_sim, tau, scenario = "RCT", 
+                              X.names.outcome,
+                              nuisance_survival = "cox", 
+                              sample_sizes = c(500, 1000, 2000, 4000)) {
+  
+  pb_n <- txtProgressBar(min = 0, max = length(sample_sizes), 
+                         style = 3, initial = 0, char = "#")
+  on.exit(close(pb_n))
+  
+  results <- data.frame(
+    "sample.size" = numeric(),
+    "estimate" = numeric(),
+    "estimator" = character(),
+    "nuisance" = character()
+  )
+  
+  # Loop through each sample size
+  for (idx_n in seq_along(sample_sizes)) {
+    n <- sample_sizes[idx_n]
+    
+    # Progress bar for simulations
+    pb <- txtProgressBar(min = 0, max = n_sim, style = 3, initial = 0, char = "#")
+    on.exit(close(pb))
+    
+    # Loop through each simulation
+    for (i in 1:n_sim) {
+      setTxtProgressBar(pb, i)
+      
+      # Simulate data based on the scenario
+      if (scenario == "RCT") {
+        data <- simulate_data_RCT(n, tau = tau, 
+                                  scenario = "RCT")
+      } 
+      
+      # Compute all estimates for the simulated data
+      all <- all_estimates(data, n, tau = tau, 
+                           X.names.outcome,
+                           nuisance_survival)
+      results <- rbind(all, results)
+    }
+    
+    close(pb)
+    setTxtProgressBar(pb_n, idx_n)
+  }
+  
+  return(results)
+}
+```
+
+Ground truth function: 
+
+```{r}
+# Function to calculate ground truth for RCT and Observational datasets
+ground_truth <- function(tau, 
+                         data) {
+  # Compute RMST with the true T1
+  data$T1_tau <- ifelse(data$T1 >= tau, tau, data$T1)
+  
+  # Compute RMST with the true T0
+  data$T0_tau <- ifelse(data$T0 >= tau, tau, data$T0)
+  
+  # Compute the difference in RMST if everyone had the treatment 
+  # and if everyone had the control
+  truth <- mean(data$T1_tau) - mean(data$T0_tau)
+  
+  return(truth)
+}
+```
+
+The time-dependent ground truth for all the setting are displayed
+bellow:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+# Set initial tau value
+tau <- 25
+# Define vector of tau values
+vec_tau <- seq(1, 150, by = 1)
+
+# Function to plot the ground truth RMST for different scenarios
+plot_ground_truth <- function(data, vec_tau, tau, ylim, title_text) {
+  truth <- sapply(vec_tau, function(x) ground_truth(tau = x, data))
+  matplot(
+    vec_tau, truth, type = "l", lty = 1, col = 1,
+    ylab = "RMST", xlab = "tau", ylim = ylim
+  )
+  abline(v = tau, col = "red", lty = 2)
+  abline(h = truth[vec_tau == tau], col = "red", lty = 2)
+  title(title_text, cex.main = 0.9)  # Adjusting title text size
+}
+
+# Simulation for scenario RCT1
+data_RCT <- simulate_data_RCT(
+  n = 100000, tau = tau, scenario = "RCT")
+
+plot_ground_truth(data_RCT1, 
+                  vec_tau, 
+                  tau, 
+                  c(0, 10), 
+                  "True difference in RMST for RCT scenario 1")
+
+truth_tau1 <- ground_truth(data_RCT, tau = 25)
+print(paste0("The ground truth for RCT at time 25 is ", round(truth_tau1, 1)))
+```
+
+
+Global function: 
+
+```{r}
+library(dplyr)
+library(survival)
+library(riskRegression)
+library(survminer)
+library(rms)
+
+n_sim <- 150
+tau <- 25
+
+# RCT1 simulation
+simulation_rct <- compute_estimator(
+  n_sim, tau = tau, scenario = "RCT", 
+  X.names.outcome = c("P1", "P2", "P3", "P4"),
+)
+save(simulation_rct, file = "simulation_rct.RData")
+```
+
+The results are the following :
+
+```{r}
+load("simulation_rct.RData")
+# Update the theme to center the plot title
+theme_update(plot.title = element_text(hjust = 0.5))
+
+
+# Convert sample size to a factor with levels sorted in decreasing order
+simulation_rct$sample.size <- factor(
+  simulation_rct$sample.size, 
+  levels = sort(unique(simulation_rct$sample.size), decreasing = FALSE)
+)
+
+# Convert 'estimator' column to a factor with the specified order
+simulation_rct$estimator <- factor(simulation_rct$estimator)
+
+# Create the plot for RCT + independent censoring
+simulation_graph_rct <- simulation_rct %>%
+  ggplot(aes(
+    x = estimator, y = estimate,  
+    fill = factor(sample.size, levels = rev(levels(sample.size)))
+  )) +
+  scale_fill_brewer(palette = "Accent") +
+  ggtitle("Results of the ATE for the simulation of a 
+          RCT without censoring:") +
+  geom_boxplot(alpha = 0.9, show.legend = TRUE, position = "dodge") +
+  xlab("") +  # Change x-axis label
+  ylab("ATE") +  # Change y-axis label
+  stat_boxplot(geom = "errorbar") +
+  geom_hline(
+    yintercept = truth_tau1, linetype = "dashed", color = "red", 
+    alpha = 0.8, size = 0.8
+  ) +
+theme(
+    legend.title = element_blank(), legend.position = "bottom",
+    legend.box = "vertical", legend.text = element_text(size = 18),
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),  
+    # Adjust text angle for better visibility
+    axis.text = element_text(size = 15, face = "bold"),
+    axis.title.x = element_text(size = 16, face = "bold")
+  )
+```
+
+Plot: 
+
+```{r}
+simulation_graph_rct
+```
